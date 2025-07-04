@@ -60,22 +60,22 @@ def load_documents(directory_path):
     for file in os.listdir(directory_path):
         file_path = os.path.join(directory_path, file)
 
-        if file.endswith('.pdf'):
-            loader = PyPDFLoader(file_path)
-            documents.extend(loader.load())
+        if file.endswith('.pdf'): #将pdf文件解析为多个片段，然后将这些片段放入大的document中
+            loader = PyPDFLoader(file_path) #这是一个加载器，读取pdf文件，转化为文档片段（document chunks）
+            documents.extend(loader.load()) #loader.load()返回一个列表 都是document对象   然后通过extend将所有的对象放在document中 
         elif file.endswith('.docx') or file.endswith('.doc'):
             loader = Docx2txtLoader(file_path)
             documents.extend(loader.load())
 
     return documents
 
-# 2. 文本分割  创建出适合嵌入模型的小文本块 
+# 2. 文本分割  创建出适合嵌入模型的小文本块  按照分隔符切割，每块长度不超过chunk_size 允许相邻的有chunk_overlap的字符重叠 最终返回切好的小块列表
 def split_documents(documents):
     text_splitter = RecursiveCharacterTextSplitter(
         chunk_size=CHUNK_SIZE,
         chunk_overlap=CHUNK_OVERLAP,
-        length_function=len,
-        separators=[
+        length_function=len, #这个len不是变量 而是将len函数  传入
+        separators=[ 
             "\n\n",  # Split by double newlines (paragraphs)
             "\n",    # Split by single newlines
             ". ",    # Split by period followed by space (ensure space to avoid splitting mid-sentence e.g. Mr. Smith)
@@ -104,13 +104,13 @@ def initialize_embeddings():
 # 4. 创建或加载向量数据库 (Modified) 检测数据库状态  处理模型变更导致的维度问题 支持增量更新文档
 def get_vector_db(chunks, embeddings, persist_directory):
     """Creates a new vector DB or loads an existing one."""
-    if os.path.exists(persist_directory) and os.listdir(persist_directory):
+    if os.path.exists(persist_directory) and os.listdir(persist_directory): #有现成数据库就加在，没有就看有没有chunk，有就创建 
         print(f"Loading existing vector database from {persist_directory}...")
         try:
             # When loading, ChromaDB will check for dimension compatibility.
             # If EMBEDDING_MODEL_PATH changed leading to a dimension mismatch, this will fail.
-            return Chroma(persist_directory=persist_directory, embedding_function=embeddings)
-        except Exception as e:
+            return Chroma(persist_directory=persist_directory, embedding_function=embeddings) #chroma会从目录中找数据文件  并且启用embedding_function去配置
+        except Exception as e: #确保embedding模型对的
             print(f"Error loading existing vector database: {e}.")
             print(f"This might be due to a change in the embedding model and a dimension mismatch.")
             print(f"If you changed EMBEDDING_MODEL_PATH, you MUST delete the old database directory: {persist_directory}")
@@ -122,10 +122,10 @@ def get_vector_db(chunks, embeddings, persist_directory):
             print(f"Creating new vector database in {persist_directory}...")
             print(f"Creating Chroma DB with {len(chunks)} chunks...")
             try:
-                vector_db = Chroma.from_documents(
+                vector_db = Chroma.from_documents( #通过from_document把每个chunk转换为embedding并存到数据库
                     documents=chunks,
                     embedding=embeddings,
-                    persist_directory=persist_directory
+                    persist_directory=persist_directory #这是保存位置
                 )
                 print("Vector database created and persisted.")
                 return vector_db
@@ -147,33 +147,21 @@ def initialize_openai_client():
         model_name=VLLM_MODEL_NAME
     )
 
-# 6. 创建RAG检索链（使用新方法） 
-# def create_rag_chain(vector_db, llm):
-#     # 从Langchain Hub获取检索QA聊天提示
-#     retrieval_qa_prompt = hub.pull("langchain-ai/retrieval-qa-chat")
-#     # 创建文档组合链
-#     combine_docs_chain = create_stuff_documents_chain(llm, retrieval_qa_prompt)
-#     # 创建检索链
-#     # Using default similarity search. If this fails, and embedding model is good,
-#     # then advanced retrieval or query transformation might be needed.
-#     retriever = vector_db.as_retriever(search_kwargs={"k": SEARCH_K})
-#     rag_chain = create_retrieval_chain(retriever, combine_docs_chain)
-
 #     return rag_chain
-def create_rag_chain_with_memory(vector_db, llm, memory):
-    retriever = vector_db.as_retriever(search_kwargs={"k": SEARCH_K})
+def create_rag_chain_with_memory(vector_db, llm, memory): #创建带有记忆的问答链  这部分的提示词相当于都是封装的 用别人的库 可以尝试自己手写
+    retriever = vector_db.as_retriever(search_kwargs={"k": SEARCH_K}) #将向量数据库变为一个检索器，能输入问题返回最相关的k个文本
     # 直接用 ConversationalRetrievalChain，自动管理上下文
-    return ConversationalRetrievalChain.from_llm(
-        llm=llm,
-        retriever=retriever,
+    return ConversationalRetrievalChain.from_llm( #封装的类， 可以把检索器返回的文本，当前对话 历史对话拼接成一个prompt   （检索向量库得到最相关的k个，获取memory 拼接prompt LLM调用返回结果，分别对应下面的参数）
+        llm=llm, #这个指用哪个模型回答
+        retriever=retriever, #这是指用哪个检索器 
         memory=memory,
-        return_source_documents=False  # 如果不需要输出检索到的源文档，可设为 False
+        return_source_documents=False  # 如果不需要输出检索到的源文档，可设为 False 
     )
 
 # 7. Function to process query using the RAG chain (Modified for Streaming)
 def process_query(query):
     """Processes a user query using the RAG chain and streams the answer."""
-    global rag_chain, vector_db # Add vector_db to globals accessed here for debugging
+    global rag_chain, vector_db # Add vector_db to globals accessed here for debugging  这里是表明 这两个是全局变量 可以让函数内部修改函数外部定义的变量（如果没定义这个，函数内是不能修改全局变量） 也就是之前定义过的，如果不声明 会出错  
     if rag_chain is None:
         yield "错误：RAG 链未初始化。"
         return
@@ -188,8 +176,8 @@ def process_query(query):
                 # Attempt to get score if retriever supports it (Chroma's similarity_search_with_score)
                 # For basic similarity_search, score might not be directly in metadata.
                 # If using retriever.get_relevant_documents(), score might be present.
-                score = doc.metadata.get('score', 'N/A') # Placeholder, actual score retrieval might differ
-                if hasattr(doc, 'score'): # Check if score attribute exists directly
+                score = doc.metadata.get('score', 'N/A') # 先从metadata中取score 没有就返回NA
+                if hasattr(doc, 'score'): #  有些document是带score属性  这个相当于是一种兼容性 如果前者没找到 就找这个
                     score = doc.score
                 
                 print(f"Doc {i+1} (Score: {score}):")
@@ -209,9 +197,8 @@ def process_query(query):
         # The input format for create_retrieval_chain is typically {"input": query}
         # The output chunks often contain 'answer' and 'context' keys
         # response_stream = rag_chain.stream({"input": query})
-        response_stream = rag_chain.stream({
+        response_stream = rag_chain.stream({ #rag_chain就是之前创建的包括检索的数据 历史回答 拼接得到的结果 stream可以保证回复是一边生成一边返回   invoke和predict都是一次性返回整段内容
                 "question": query,
-                #"chat_history": memory.chat_memory  # 或者 memory.load_memory_variables({})["chat_history"]
                                             })
 
         full_answer = ""
@@ -219,9 +206,9 @@ def process_query(query):
         print("开始流式生成回答...")
         for chunk in response_stream:
             # Check if the 'answer' key exists in the chunk and append it
-            answer_part = chunk.get("answer", "")
+            answer_part = chunk.get("answer", "") #这边将其拼接起来  如果这样的话 比如改一下 让他们一次性输出
             if answer_part:
-                full_answer += answer_part
+                full_answer += answer_part 
                 # Debugging output
                 # print(f"Raw answer_part from LLM: '{answer_part}'")
                 # print(f"Yielding to Gradio: '{full_answer}'")
@@ -232,11 +219,11 @@ def process_query(query):
 
         print(f"流式处理完成。最终回答: {full_answer}")
 
-    except Exception as e:
+    except Exception as e: # 先简要打印错误信息 然后通过traceback 输出完整的错误栈追踪
         print(f"处理查询时发生错误: {e}")
         import traceback
         traceback.print_exc() # Print stack trace for debugging
-        yield f"处理查询时发生错误: {e}"
+        yield f"处理查询时发生错误: {e}"#注意 如果是print前端不会受到然后信息  yield可以
 
 # 8. Function to rebuild the index and RAG chain (Modified to add documents)
 def rebuild_index_and_chain(): #全流程索引重建  文档加载-分割-嵌入-存储   
@@ -288,7 +275,7 @@ def rebuild_index_and_chain(): #全流程索引重建  文档加载-分割-嵌�
     # Step 3: Load or Create/Update vector database
     print("加载或更新向量数据库...")
     # Try loading first, even if we have chunks (in case we want to add to it)
-    vector_db_loaded = get_vector_db(None, embeddings, PERSIST_DIR)
+    vector_db_loaded = get_vector_db(None, embeddings, PERSIST_DIR) #None用于加载一个已经存在的数据库 不想新建
 
     if vector_db_loaded:
         print(f"向现有向量数据库添加 {len(chunks)} 个块...")
@@ -309,7 +296,7 @@ def rebuild_index_and_chain(): #全流程索引重建  文档加载-分割-嵌�
         print(f"创建新的向量数据库并添加 {len(chunks)} 个块...")
         try:
             # Call get_vector_db again, this time *with* chunks to trigger creation
-            vector_db = get_vector_db(chunks, embeddings, PERSIST_DIR)
+            vector_db = get_vector_db(chunks, embeddings, PERSIST_DIR) #用于新建数据库
             if vector_db is None: # Check if creation failed within get_vector_db
                  raise RuntimeError("get_vector_db failed to create a new database.")
             print("新的向量数据库已创建并持久化。")
@@ -330,13 +317,13 @@ def rebuild_index_and_chain(): #全流程索引重建  文档加载-分割-嵌�
 # Helper function to list documents in the directory 生成已加载的文档列表 markdown格式化输出  实时更新文档状态
 def get_loaded_documents_list():
     """Returns a Markdown formatted list of files in DOCUMENTS_DIR."""
-    if not os.path.exists(DOCUMENTS_DIR) or not os.listdir(DOCUMENTS_DIR):
+    if not os.path.exists(DOCUMENTS_DIR) or not os.listdir(DOCUMENTS_DIR): #存在则函数返回true  如果文档存在，并且里面有东西就不返回内容
         return "当前没有已加载的文档。"
     try:
-        files = [f for f in os.listdir(DOCUMENTS_DIR) if os.path.isfile(os.path.join(DOCUMENTS_DIR, f)) and (f.endswith('.pdf') or f.endswith('.docx') or f.endswith('.doc'))]
-        if not files:
+        files = [f for f in os.listdir(DOCUMENTS_DIR) if os.path.isfile(os.path.join(DOCUMENTS_DIR, f)) and (f.endswith('.pdf') or f.endswith('.docx') or f.endswith('.doc'))]# 符合条件的全部遍历
+        if not files: 
             return "当前没有已加载的文档。"
-        markdown_list = "### 当前已加载文档:\n" + "\n".join([f"- {file}" for file in files])
+        markdown_list = "### 当前已加载文档:\n" + "\n".join([f"- {file}" for file in files]) #这里的f只是一种格式化写法  用于{file}
         return markdown_list
     except Exception as e:
         print(f"Error listing documents: {e}")
@@ -388,11 +375,11 @@ def handle_submit_with_thinking(query_text, chat_history):
     if not query_text or query_text.strip() == "":
         yield "", chat_history
         return
-
-    # 拼接所有记忆内容到用户输入前面
-    if user_facts:
+  
+    # 拼接所有记忆内容到用户输入前面  这里可以修改一下 比如给一个顺序，没经过几次对话，就删掉之前的内容 防止内容太多 导致超过最大长度
+    if user_facts:  
         memory_prefix = "，".join(user_facts)
-        full_query = f"请记住：{memory_prefix}。用户提问：{query_text}"
+        full_query = f"请记住：{memory_prefix}。用户提问：{query_text}" #这个是将用户的提问和回答放在一起用于记忆
     else:
         full_query = query_text
 
@@ -403,21 +390,21 @@ def handle_submit_with_thinking(query_text, chat_history):
 
     for stream_chunk in process_query(full_query):
         final_response_from_rag = stream_chunk
-        chat_history[-1] = (query_text, final_response_from_rag)
+        chat_history[-1] = (query_text, final_response_from_rag) #因为chat_history是一个二元组 这个意思是用后面的内容替代历史对话的最近一次内容
         yield "", chat_history
 
-    if chat_history and chat_history[-1][1] == "思考中...":
+    if chat_history and chat_history[-1][1] == "思考中...": #如果内容全是思考中就直接pass掉
         pass
  
     # 新增：将本轮对话存入向量库 后序可以添加过滤功能 防止对话污染信息
-    if vector_db is not None and query_text.strip() and final_response_from_rag.strip():
+    if vector_db is not None and query_text.strip() and final_response_from_rag.strip(): #strip去掉开头和结尾的空白字符
         # 组合成一个片段
         dialogue_text = f"用户: {query_text}\nAI: {final_response_from_rag}"
         # 创建 Document 对象
-        doc = Document(page_content=dialogue_text, metadata={"type": "chat_history"})
-        try:
-            vector_db.add_documents([doc])
-            # 可选：print("对话已存入向量库")
+        doc = Document(page_content=dialogue_text, metadata={"type": "chat_history"}) #打个标签 表示这个是对话历史
+        try: 
+            vector_db.add_documents([doc]) #相当于把历史文档加载进去
+            # 可选：print("对话已存入向量库") 
         except Exception as e:
             print(f"存储对话到向量库失败: {e}")
 
@@ -512,31 +499,31 @@ body, .gradio-container { font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans
     """
 
     # --- Gradio Interface using Blocks ---
-    print("\n设置 Gradio 界面...")
-    with gr.Blocks(theme=gr_themes.Soft(), css=custom_css) as iface:
-        gr.Markdown(f"""
-        <div style='text-align: center;'>
+    print("\n设置 Gradio 界面...") 
+    with gr.Blocks(theme=gr_themes.Soft(), css=custom_css) as iface: #blocks是gradio的界面容器 可以添加按钮等各种东西   theme 是设置主题的  css是指加载自定义的美化规则之类的
+        gr.Markdown(f"""     
+        <div style='text-align: center;'> 
         <h1>耀安科技-煤矿大模型知识问答系统</h1>
         <p>根据已有的文档或您上传的文档提问。</p>
         </div>
-        """)
+        """)  #markdown gradio的组件 用于显示一些html文本   第一行表示文本内容居中 <h1>表示是大标题  <p>表示是副标题 或者是说明文字 （一个就是字体小的）
 
-        with gr.Tab("问答"):
-            with gr.Column(elem_id="chat-column"): # Added a column for better layout control
-                chatbot_output = gr.Chatbot(
+        with gr.Tab("问答"): #创建了问答页面
+            with gr.Column(elem_id="chat-column"): # Added a column for better layout control  创建一个垂直排列的布局容器 并设置对应id
+                chatbot_output = gr.Chatbot( #创建一个聊天窗口
                     label="对话窗口",
-                    bubble_full_width=False, # Bubbles don't take full width
+                    bubble_full_width=False, # Bubbles don't take full width 
                     height=600, # Set a fixed height for the chat area
-                    avatar_images=(None, "https://img.icons8.com/fluency/48/chatbot.png"), # User avatar none, bot has a simple icon
-                    latex_delimiters=[
+                    avatar_images=(None, "https://img.icons8.com/fluency/48/chatbot.png"), # User avatar none, bot has a simple icon 左边是用户的 表示无头像 右边是机器人头像
+                    latex_delimiters=[ #表示支持latex数学公式显示
                         {"left": "$$", "right": "$$", "display": True},
                         {"left": "$", "right": "$", "display": False}
                     ]
                     # render_markdown=True,  # Explicitly set, default is True
                     # sanitize_html=False    # Test by disabling HTML sanitization
                 )
-                with gr.Row(elem_id="chat_input_row"): # Row for input textbox and button
-                    query_input = gr.Textbox(
+                with gr.Row(elem_id="chat_input_row"): # Row for input textbox and button  在聊天框下面创建横向区域用于输入框和按钮
+                    query_input = gr.Textbox( #创建文本输入框 
                         show_label=False,
                         placeholder="在此输入您的问题...",
                         lines=1, # Single line input initially, can expand
@@ -545,17 +532,17 @@ body, .gradio-container { font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans
                     submit_button = gr.Button("发送", scale=1) # "Send" button
 
         with gr.Tab("上传与管理文档"): # Renamed tab for clarity
-            with gr.Row():
-                with gr.Column(scale=1):
+            with gr.Row(): #表示横向布局容器 这里面的内容是从左往右水平排列
+                with gr.Column(scale=1): #column表示纵向 接下来纵向表示
                     file_input = gr.File(label="上传 PDF 或 DOCX 文件", file_types=['.pdf', '.docx', '.doc'])
                     upload_button = gr.Button("上传并重建索引")
-                    upload_status = gr.Textbox(label="上传状态", interactive=False)
-                with gr.Column(scale=1):
+                    upload_status = gr.Textbox(label="上传状态", interactive=False) #interactive 表示是否可编辑
+                with gr.Column(scale=1): #scale表示权重占比 如果两个都是一 则代表平分
                     # Component to display loaded documents
                     loaded_docs_display = gr.Markdown(value=initial_doc_list)
 
-        with gr.Tab("使用教程"):
-            gr.Markdown("""
+        with gr.Tab("使用教程"): #markdown内容是直接是被显示  #不显示
+            gr.Markdown(""" 
             ## 如何使用本 RAG 系统
 
             **1. 准备文档:**
@@ -587,19 +574,19 @@ body, .gradio-container { font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans
         # Q&A Submission for Chatbot
         # The `fn` now takes query_input and chatbot_output (history)
         # It returns a tuple: (new_value_for_query_input, new_value_for_chatbot_output)
-        submit_button.click(
+        submit_button.click( #当触发发生按钮时需要做的事情
             fn=handle_submit_with_thinking,
             inputs=[query_input, chatbot_output],
             outputs=[query_input, chatbot_output] # query_input is cleared, chatbot_output is updated
-        )
-        query_input.submit( 
+        ) 
+        query_input.submit(  #上面是通过点击实现 这个是通过回车实现
              fn=handle_submit_with_thinking,
              inputs=[query_input, chatbot_output],
              outputs=[query_input, chatbot_output]
         )
 
         # File Upload and Rebuild
-        upload_button.click(
+        upload_button.click( 
             fn=handle_file_upload,
             inputs=file_input,
             outputs=[upload_status, loaded_docs_display] # Update both status and doc list
