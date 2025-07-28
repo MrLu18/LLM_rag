@@ -1,11 +1,12 @@
 import os
+import re
 import shutil
 from langchain_community.document_loaders import PyPDFLoader, Docx2txtLoader
 from langchain.text_splitter import RecursiveCharacterTextSplitter
 from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_chroma import Chroma
 from langchain.chains import ConversationalRetrievalChain
-#from langchain.schema import Document
+from langchain.schema import Document
 from langchain_openai import ChatOpenAI
 from rag_new.config import (
     DOCUMENTS_DIR,
@@ -39,7 +40,7 @@ memory = ConversationBufferWindowMemory(
     return_messages=True,
     k=MAX_TURNS
 )
-user_facts = []
+user_facts = []  #这个变量只会存储提问的问题 不包含回答的问题
 
 
 
@@ -69,7 +70,7 @@ def trim_memory_tokens(memory_obj): #此函数要求对话历史不超过三轮�
     memory_obj.chat_memory.messages = history
 
 
-def handle_memory_and_query_prep(query_text, current_user_facts):
+def handle_memory_and_query_prep(query_text, current_user_facts): #前者是提问 后者是目前存储的内容  这个函数只会存储要求记住的内容 如果是提问，只会把之前要求记住的内容和提问拼接起来返回回去
     """Handles the memory feature and prepares the full query."""
     # Create a mutable copy of user_facts to modify within this function
     updated_user_facts = list(current_user_facts)
@@ -83,7 +84,7 @@ def handle_memory_and_query_prep(query_text, current_user_facts):
             return "", updated_user_facts # Indicate it's a memory command, no query for RAG
 
     # 拼接所有记忆内容到用户输入前面
-    if updated_user_facts:
+    if updated_user_facts: #这部分的memory_prefix都是用户要求记住的内容，可以理解为问题重写了一遍，但至少增加了一部分要求记住的内容
         memory_prefix = "，".join(updated_user_facts)
         full_query = f"请记住：{memory_prefix}。用户提问：{query_text}"
     else:
@@ -111,30 +112,74 @@ def load_documents(directory_path):
 
     return documents
 
-# 2. 文本分割  创建出适合嵌入模型的小文本块  按照分隔符切割，每块长度不超过chunk_size 允许相邻的有chunk_overlap的字符重叠 最终返回切好的小块列表
-def split_documents(documents):
-    text_splitter = RecursiveCharacterTextSplitter(
+def split_documents(documents: list) -> list:
+    """
+    只传入 documents 列表，对每个文档先按章节分，再按块分
+    内部使用默认规则（分章节规则 + chunk_size + chunk_overlap）
+    返回所有拆分后的 Document 对象
+    """
+
+    # 固定参数
+    section_pattern = r"\n(?=\d{1,2}\s)"  # 如 1 范围、2 引用文件 章节划分的格式可以更加完善一些 目前的正则匹配是 换行+数字+空格 (?=)是正向预查
+
+    # 拆分器配置
+    splitter = RecursiveCharacterTextSplitter(
         chunk_size=CHUNK_SIZE,
         chunk_overlap=CHUNK_OVERLAP,
-        length_function=len, #这个len不是变量 而是将len函数  传入
-        separators=[ 
-            "\n\n",  # Split by double newlines (paragraphs)
-            "\n",    # Split by single newlines
-            ". ",    # Split by period followed by space (ensure space to avoid splitting mid-sentence e.g. Mr. Smith)
-            "? ",    # Split by question mark followed by space
-            "! ",    # Split by exclamation mark followed by space
-            "。 ",   # Chinese period followed by space (if applicable)
-            "？ ",   # Chinese question mark followed by space (if applicable)
-            "！ ",   # Chinese exclamation mark followed by space (if applicable)
-            "。\n",  # Chinese period followed by newline
-            "？\n",  # Chinese question mark followed by newline
-            "！\n",  # Chinese exclamation mark followed by newline
-            " ",     # Split by space as a fallback
-            ""       # Finally, split by character if no other separator is found
-        ],
+        length_function=len,
+        separators=["\n\n", "\n", "。", ". ", " ", ""], #感觉问号 感叹号什么的还是放置一起好 
         is_separator_regex=False
     )
-    return text_splitter.split_documents(documents)
+
+    all_chunks = []
+
+    for doc in documents:
+        text = doc.page_content
+        metadata = doc.metadata or {}
+
+        # 先按章节正则分
+        sections = re.split(section_pattern, text)
+
+        for section in sections:
+            cleaned = section.strip()
+            if not cleaned:
+                continue
+
+            # 短章节直接保留
+            if len(cleaned) <= CHUNK_SIZE:
+                all_chunks.append(Document(page_content=cleaned, metadata=metadata))
+            else:
+                # 长章节再拆块
+                sub_chunks = splitter.split_text(cleaned)
+                for chunk in sub_chunks:
+                    all_chunks.append(Document(page_content=chunk, metadata=metadata))
+
+    return all_chunks
+
+# 2. 文本分割  创建出适合嵌入模型的小文本块  按照分隔符切割，每块长度不超过chunk_size 允许相邻的有chunk_overlap的字符重叠 最终返回切好的小块列表
+# def split_documents(documents):
+#     text_splitter = RecursiveCharacterTextSplitter(
+#         chunk_size=CHUNK_SIZE,
+#         chunk_overlap=CHUNK_OVERLAP,
+#         length_function=len, #这个len不是变量 而是将len函数  传入
+#         separators=[  #拆分的逻辑顺序
+#             "\n\n",  # 按双换行分段（段落优先）
+#             "\n",    # 按单换行分段
+#             ". ",    # 按英文句号+空格分
+#             "? ",    # 按问号+空格分
+#             "! ",    # 按感叹号+空格分
+#             "。 ",   # 中文句号+空格
+#             "？ ",   # 中文问号+空格
+#             "！ ",   # 中文感叹号+空格
+#             "。\n",  # 中文句号+换行
+#             "？\n",  # 中文问号+换行
+#             "！\n",  # 中文感叹号+换行
+#             " ",     # 按空格分（如果还没分完）
+#             ""       # 最后按字符分（最细粒度）
+#         ],
+#         is_separator_regex=False
+#     )
+#     return text_splitter.split_documents(documents)
 
 # 3. 初始化HuggingFace嵌入模型 配置gpu加速  返回文本向量化器 
 def initialize_embeddings():
@@ -144,7 +189,7 @@ def initialize_embeddings():
     )
 
 # 4. 创建或加载向量数据库 (Modified) 检测数据库状态  处理模型变更导致的维度问题 支持增量更新文档
-def get_vector_db(chunks, embeddings, persist_directory):
+def get_vector_db(chunks, embeddings, persist_directory): #这个函数表明如果有向量数据库则直接读取向量数据库然后返回即可，那么如果有新增的文件，这个函数没办法处理
     """Creates a new vector DB or loads an existing one."""
     if os.path.exists(persist_directory) and os.listdir(persist_directory): #有现成数据库就加在，没有就看有没有chunk，有就创建 
         print(f"Loading existing vector database from {persist_directory}...")
@@ -179,7 +224,7 @@ def get_vector_db(chunks, embeddings, persist_directory):
             print(f"Vector database directory {persist_directory} not found or empty, and no chunks provided to create a new one.")
             return None # Indicate DB doesn't exist and cannot be created yet
 
-# 5. 初始化连接到VLLM服务器的ChatOpenAI客户端 (Replaces initialize_llm) 连接VLLM推理服务器 配置模型 返回兼容接口
+# 5. 初始化连接到VLLM服务器的ChatOpenAI客户端 (Replaces initialize_llm) 连接VLLM推理服务器 配置模型 返回兼容接口  这一步也相当于给全局变量llm赋值
 def initialize_openai_client():
     """Initializes ChatOpenAI client pointing to the VLLM server."""
     print(f"Initializing ChatOpenAI client for VLLM server at {VLLM_BASE_URL}...")
@@ -190,7 +235,7 @@ def initialize_openai_client():
     )
 
 def create_rag_chain_with_memory(vector_db_arg, llm_arg, memory_arg): #创建带有记忆的问答链  这部分的提示词相当于都是封装的 用别人的库 可以尝试自己手写
-    retriever = vector_db_arg.as_retriever(search_kwargs={"k": SEARCH_K}) #将向量数据库变为一个检索器，能输入问题返回最相关的k个文本
+    retriever = vector_db_arg.as_retriever(search_kwargs={"k": SEARCH_K}) #将向量数据库变为一个检索器（包装成，同时也设置好了接口），能输入问题返回最相关的k个文本 
     # 直接用 ConversationalRetrievalChain，自动管理上下文
     return ConversationalRetrievalChain.from_llm( #封装的类， 可以把检索器返回的文本，当前对话 历史对话拼接成一个prompt   （检索向量库得到最相关的k个，获取memory 拼接prompt LLM调用返回结果，分别对应下面的参数）
         llm=llm_arg, #这个指用哪个模型回答
@@ -213,7 +258,7 @@ def process_query(query):
     # Uncomment the block below to see what documents are retrieved by the vector DB
     if vector_db:
         try:
-            retrieved_docs = vector_db.similarity_search(query, k=SEARCH_K)
+            retrieved_docs = vector_db.similarity_search(query, k=SEARCH_K) #检索最相近的文档
             print(f"\n--- Retrieved Documents for query: '{query}' ---")
             for i, doc in enumerate(retrieved_docs):
                 # Attempt to get score if retriever supports it (Chroma's similarity_search_with_score)
@@ -224,7 +269,7 @@ def process_query(query):
                     score = doc.score
                 
                 print(f"Doc {i+1} (Score: {score}):")
-                print(f"Content: {doc.page_content[:500]}...") # Print first 500 chars
+                print(f"Content: {doc.page_content[:500]}...") # Print first 500 chars 表示只打印前五百字符 这样可避免终端内容过多
                 print(f"Metadata: {doc.metadata}")
             print("--- End Retrieved Documents ---\n")
         except Exception as e:
@@ -240,16 +285,16 @@ def process_query(query):
         # The input format for create_retrieval_chain is typically {"input": query}
         # The output chunks often contain 'answer' and 'context' keys
         # response_stream = rag_chain.stream({"input": query})
-        response_stream = rag_chain.stream({
+        response_stream = rag_chain.stream({ #传入字典 然后流式回答  #这个response_stream是一个生成器对象
                 "question": query,
                                             })
 
         full_answer = ""
         # Yield chunks as they arrive. Gradio Textbox updates incrementally.
         print("开始流式生成回答...")
-        for chunk in response_stream:
+        for chunk in response_stream: #每循环一次都会拿到新的内容 我觉得这里才是流式输出的关键 之前的yield都不算
             # Check if the 'answer' key exists in the chunk and append it
-            answer_part = chunk.get("answer", "")
+            answer_part = chunk.get("answer", "") #get 这个键值 没有则返回空
             if answer_part:
                 full_answer += answer_part 
                 # Debugging output
@@ -269,7 +314,7 @@ def process_query(query):
         yield f"处理查询时发生错误: {e}"
 
 # 8. Function to rebuild the index and RAG chain (Modified to add documents)
-def rebuild_index_and_chain():
+def rebuild_index_and_chain(): #这个函数的逻辑有问题  后期需要修复
     """Loads documents, creates/updates vector DB by adding new content, and rebuilds the RAG chain."""
     global vector_db, rag_chain, embeddings, llm
 
@@ -284,8 +329,8 @@ def rebuild_index_and_chain():
 
     # Step 1: Load documents
     print("加载文档...")
-    documents = load_documents(DOCUMENTS_DIR)
-    if not documents:
+    documents = load_documents(DOCUMENTS_DIR) #这部分逻辑不太对 因为这个目录包括了之前的文档 那么会导致文档的重复添加 但是这是在未找到文档的情况才加载之前的向量数据库 也还好
+    if not documents: 
         print(f"在 {DOCUMENTS_DIR} 中未找到文档。")
         # Try to load existing DB even if no new documents are found
         print("尝试加载现有向量数据库...")
@@ -302,12 +347,14 @@ def rebuild_index_and_chain():
             return "错误：没有文档可加载，且没有现有的向量数据库。"
 
     # Step 2: Split text
-    print("分割文本...")
+    print("分割文本...") 
     chunks = split_documents(documents)
+    for chunk in chunks:
+        print("chunks是什么\n",chunk)
     if not chunks:
         print("分割后未生成文本块。")
         # Try loading existing DB if splitting yielded nothing
-        print("尝试加载现有向量数据库...")
+        print("尝试加载现有向量数据库...") 
         vector_db_loaded = get_vector_db(None, embeddings, PERSIST_DIR)
         if vector_db_loaded:
              vector_db = vector_db_loaded
@@ -319,12 +366,12 @@ def rebuild_index_and_chain():
             return "错误：文档分割后未产生任何文本块，且无现有数据库。"
 
     # Step 3: Load or Create/Update vector database
-    print("加载或更新向量数据库...")
+    print("加载或更新向量数据库...") #加载文档中的向量数据库 但如果文档已经转换过向量数据库 那么会导致再添加一次  除非设置好这里的文档都是新添加过的文档
     # Try loading first, even if we have chunks (in case we want to add to it)
     vector_db_loaded = get_vector_db(None, embeddings, PERSIST_DIR)
 
     if vector_db_loaded:
-        print(f"向现有向量数据库添加 {len(chunks)} 个块...")
+        print(f"向现有向量数据库添加 {len(chunks)} 个块...") #主要问题在于这个chunk可能包含重复内容
         vector_db = vector_db_loaded # Use the loaded DB
         try:
             vector_db.add_documents(chunks)
@@ -378,231 +425,232 @@ def rebuild_index_and_chain():
 
 
 # Helper function to list documents in the directory 生成已加载的文档列表 markdown格式化输出  实时更新文档状态
-def get_loaded_documents_list():
-    """Returns a Markdown formatted list of files in DOCUMENTS_DIR."""
-    if not os.path.exists(DOCUMENTS_DIR) or not os.listdir(DOCUMENTS_DIR):
-        return "当前没有已加载的文档。"
-    try:
-        files = [f for f in os.listdir(DOCUMENTS_DIR) if os.path.isfile(os.path.join(DOCUMENTS_DIR, f)) and (f.endswith('.pdf') or f.endswith('.docx') or f.endswith('.doc'))]
-        if not files: 
-            return "当前没有已加载的文档。"
-        markdown_list = "### 当前已加载文档:\n" + "\n".join([f"- {file}" for file in files])
-        return markdown_list
-    except Exception as e:
-        print(f"Error listing documents: {e}")
-        return "无法列出文档。"
+# def get_loaded_documents_list():
+#     """Returns a Markdown formatted list of files in DOCUMENTS_DIR."""
+#     if not os.path.exists(DOCUMENTS_DIR) or not os.listdir(DOCUMENTS_DIR):
+#         return "当前没有已加载的文档。"
+#     try:
+#         files = [f for f in os.listdir(DOCUMENTS_DIR) if os.path.isfile(os.path.join(DOCUMENTS_DIR, f)) and (f.endswith('.pdf') or f.endswith('.docx') or f.endswith('.doc'))]
+#         if not files: 
+#             return "当前没有已加载的文档。"
+#         markdown_list = "### 当前已加载文档:\n" + "\n".join([f"- {file}" for file in files])
+#         return markdown_list
+#     except Exception as e:
+#         print(f"Error listing documents: {e}")
+#         return "无法列出文档。"
 
-# 9. Function to handle file uploads (Modified to return doc list)
-def handle_file_upload(file_obj):
-    """Saves the uploaded file, triggers index rebuilding, and returns status and doc list."""
-    if file_obj is None:
-        return "未选择文件。", get_loaded_documents_list() # Return current list even if no file selected
+#这个功能应该不需要
+# 9. Function to handle file uploads (Modified to return doc list) 
+# def handle_file_upload(file_obj):
+#     """Saves the uploaded file, triggers index rebuilding, and returns status and doc list."""
+#     if file_obj is None:
+#         return "未选择文件。", get_loaded_documents_list() # Return current list even if no file selected
 
-    try:
-        # Gradio provides a temporary file path
-        temp_file_path = file_obj.name
-        file_name = os.path.basename(temp_file_path)
-        destination_path = os.path.join(DOCUMENTS_DIR, file_name)
+#     try:
+#         # Gradio provides a temporary file path
+#         temp_file_path = file_obj.name
+#         file_name = os.path.basename(temp_file_path)
+#         destination_path = os.path.join(DOCUMENTS_DIR, file_name)
 
-        print(f"将上传的文件从 {temp_file_path} 复制到 {destination_path}")
-        # Ensure documents directory exists
-        if not os.path.exists(DOCUMENTS_DIR):
-            os.makedirs(DOCUMENTS_DIR)
-        shutil.copy(temp_file_path, destination_path) # Copy the file
+#         print(f"将上传的文件从 {temp_file_path} 复制到 {destination_path}")
+#         # Ensure documents directory exists
+#         if not os.path.exists(DOCUMENTS_DIR):
+#             os.makedirs(DOCUMENTS_DIR)
+#         shutil.copy(temp_file_path, destination_path) # Copy the file
 
-        print(f"文件 {file_name} 上传成功。开始重建索引...")
-        status = rebuild_index_and_chain()
-        final_status = f"文件 '{file_name}' 上传成功。\n{status}"
-        # Get updated document list
-        doc_list_md = get_loaded_documents_list()
-        return final_status, doc_list_md
+#         print(f"文件 {file_name} 上传成功。开始重建索引...")
+#         status = rebuild_index_and_chain()
+#         final_status = f"文件 '{file_name}' 上传成功。\n{status}"
+#         # Get updated document list
+#         doc_list_md = get_loaded_documents_list()
+#         return final_status, doc_list_md
 
-    except Exception as e:
-        print(f"文件上传或处理失败: {e}")
-        # Return error and current doc list
-        return f"文件上传或处理失败: {e}", get_loaded_documents_list() 
+#     except Exception as e:
+#         print(f"文件上传或处理失败: {e}")
+#         # Return error and current doc list
+#         return f"文件上传或处理失败: {e}", get_loaded_documents_list() 
 
 
-def detect_and_remove_duplicates():
-    """
-    检测并清除向量库中的重复内容
-    返回检测结果和清理状态
-    """
-    global vector_db
+# def detect_and_remove_duplicates():
+#     """
+#     检测并清除向量库中的重复内容
+#     返回检测结果和清理状态
+#     """
+#     global vector_db
     
-    if vector_db is None:
-        return "错误：向量数据库未初始化"
+#     if vector_db is None:
+#         return "错误：向量数据库未初始化"
     
-    try:
-        print("开始检测向量库中的重复内容...")
+#     try:
+#         print("开始检测向量库中的重复内容...")
         
-        # 获取向量库中的所有文档
-        all_docs = vector_db.get()
-        if not all_docs or not all_docs['documents']:
-            return "向量库为空，无需检测重复内容"
+#         # 获取向量库中的所有文档
+#         all_docs = vector_db.get()
+#         if not all_docs or not all_docs['documents']:
+#             return "向量库为空，无需检测重复内容"
         
-        documents = all_docs['documents']
-        metadatas = all_docs['metadatas']
-        ids = all_docs['ids']
+#         documents = all_docs['documents']
+#         metadatas = all_docs['metadatas']
+#         ids = all_docs['ids']
         
-        print(f"向量库中共有 {len(documents)} 个文档块")
+#         print(f"向量库中共有 {len(documents)} 个文档块")
         
-        # 检测重复内容
-        seen_contents = {}
-        duplicate_ids = []
-        duplicate_info = []
+#         # 检测重复内容
+#         seen_contents = {}
+#         duplicate_ids = []
+#         duplicate_info = []
         
-        for i, (doc_id, content, metadata) in enumerate(zip(ids, documents, metadatas)):
-            # 清理内容用于比较（去除多余空格和换行）
-            cleaned_content = ' '.join(content.strip().split())
+#         for i, (doc_id, content, metadata) in enumerate(zip(ids, documents, metadatas)):
+#             # 清理内容用于比较（去除多余空格和换行）
+#             cleaned_content = ' '.join(content.strip().split())
             
-            if cleaned_content in seen_contents:
-                # 发现重复
-                original_id = seen_contents[cleaned_content]
-                duplicate_ids.append(doc_id)
-                duplicate_info.append({
-                    'duplicate_id': doc_id,
-                    'original_id': original_id,
-                    'content_preview': content[:100] + '...' if len(content) > 100 else content,
-                    'source': metadata.get('source', 'unknown') if metadata else 'unknown'
-                })
-                print(f"发现重复内容 - ID: {doc_id}, 原始ID: {original_id}")
-            else:
-                seen_contents[cleaned_content] = doc_id
+#             if cleaned_content in seen_contents:
+#                 # 发现重复
+#                 original_id = seen_contents[cleaned_content]
+#                 duplicate_ids.append(doc_id)
+#                 duplicate_info.append({
+#                     'duplicate_id': doc_id,
+#                     'original_id': original_id,
+#                     'content_preview': content[:100] + '...' if len(content) > 100 else content,
+#                     'source': metadata.get('source', 'unknown') if metadata else 'unknown'
+#                 })
+#                 print(f"发现重复内容 - ID: {doc_id}, 原始ID: {original_id}")
+#             else:
+#                 seen_contents[cleaned_content] = doc_id
         
-        if not duplicate_ids:
-            return "未发现重复内容"
+#         if not duplicate_ids:
+#             return "未发现重复内容"
         
-        # 删除重复内容
-        print(f"开始删除 {len(duplicate_ids)} 个重复文档...")
-        vector_db.delete(ids=duplicate_ids)
+#         # 删除重复内容
+#         print(f"开始删除 {len(duplicate_ids)} 个重复文档...")
+#         vector_db.delete(ids=duplicate_ids)
         
-        # 重新创建RAG链
-        global rag_chain, llm, memory
-        if llm is not None:
-            rag_chain = create_rag_chain_with_memory(vector_db, llm, memory)
+#         # 重新创建RAG链
+#         global rag_chain, llm, memory
+#         if llm is not None:
+#             rag_chain = create_rag_chain_with_memory(vector_db, llm, memory)
         
-        # 生成详细报告
-        report = f"重复内容清理完成！\n"
-        report += f"- 检测到 {len(duplicate_ids)} 个重复文档\n"
-        report += f"- 已删除重复内容，保留原始文档\n"
-        report += f"- 当前向量库剩余 {len(documents) - len(duplicate_ids)} 个文档块\n\n"
+#         # 生成详细报告
+#         report = f"重复内容清理完成！\n"
+#         report += f"- 检测到 {len(duplicate_ids)} 个重复文档\n"
+#         report += f"- 已删除重复内容，保留原始文档\n"
+#         report += f"- 当前向量库剩余 {len(documents) - len(duplicate_ids)} 个文档块\n\n"
         
-        report += "重复内容详情：\n"
-        for i, dup in enumerate(duplicate_info, 1):
-            report += f"{i}. 重复ID: {dup['duplicate_id']}\n"
-            report += f"   原始ID: {dup['original_id']}\n"
-            report += f"   来源: {dup['source']}\n"
-            report += f"   内容预览: {dup['content_preview']}\n\n"
+#         report += "重复内容详情：\n"
+#         for i, dup in enumerate(duplicate_info, 1):
+#             report += f"{i}. 重复ID: {dup['duplicate_id']}\n"
+#             report += f"   原始ID: {dup['original_id']}\n"
+#             report += f"   来源: {dup['source']}\n"
+#             report += f"   内容预览: {dup['content_preview']}\n\n"
         
-        print("重复内容清理完成")
-        return report
+#         print("重复内容清理完成")
+#         return report
         
-    except Exception as e:
-        error_msg = f"检测重复内容时发生错误: {e}"
-        print(error_msg)
-        import traceback
-        traceback.print_exc()
-        return error_msg
+#     except Exception as e:
+#         error_msg = f"检测重复内容时发生错误: {e}"
+#         print(error_msg)
+#         import traceback
+#         traceback.print_exc()
+#         return error_msg
+
+#不需要这个功能 在每次运行的时候 提前将所有文档传入上去 每次清空向量数据库,这样就不需要对于向量数据库操作的函数
+# def analyze_vector_db_content():
+#     """
+#     分析向量库内容，提供统计信息
+#     """
+#     global vector_db
+    
+#     if vector_db is None:
+#         return "错误：向量数据库未初始化"
+    
+#     try:
+#         # 获取向量库中的所有文档
+#         all_docs = vector_db.get()
+#         if not all_docs or not all_docs['documents']:
+#             return "向量库为空"
+        
+#         documents = all_docs['documents']
+#         metadatas = all_docs['metadatas']
+#         ids = all_docs['ids']
+        
+#         # 统计信息
+#         total_chunks = len(documents)
+#         total_chars = sum(len(doc) for doc in documents)
+#         avg_chunk_length = total_chars / total_chunks if total_chunks > 0 else 0
+        
+#         # 按来源文件统计
+#         source_stats = {}
+#         for metadata in metadatas:
+#             if metadata and 'source' in metadata:#检查metadata中有没有source这个键 这个source代表数据来自哪个文件
+#                 source = metadata['source']
+#                 source_stats[source] = source_stats.get(source, 0) + 1 #source_stats.get(source, 0)这个是source_stats中source对应的值 如果没有则返回0
+        
+#         # 检测潜在重复 
+#         content_hashes = {}
+#         potential_duplicates = 0
+        
+#         for content in documents:
+#             cleaned_content = ' '.join(content.strip().split()) #strip消除前后空格和分行符，然后通过split将一个字符串分为多个单个字符，然后通过空格把他们连接起来
+#             if cleaned_content in content_hashes:
+#                 potential_duplicates += 1
+#             else:
+#                 content_hashes[cleaned_content] = 1
+        
+#         # 生成报告
+#         report = f"## 向量库内容分析报告\n\n"
+#         report += f"**基本信息：**\n"
+#         report += f"- 总文档块数: {total_chunks}\n"
+#         report += f"- 总字符数: {total_chars:,}\n"
+#         report += f"- 平均块长度: {avg_chunk_length:.1f} 字符\n"
+#         report += f"- 潜在重复块: {potential_duplicates}\n\n"
+        
+#         if source_stats:
+#             report += f"**按来源文件统计：**\n"
+#             for source, count in sorted(source_stats.items(), key=lambda x: x[1], reverse=True):
+#                 report += f"- {os.path.basename(source)}: {count} 块\n"
+        
+#         if potential_duplicates > 0:
+#             report += f"\n**注意：** 发现 {potential_duplicates} 个潜在重复内容，建议运行重复内容清理。"
+        
+#         return report
+        
+#     except Exception as e:
+#         error_msg = f"分析向量库内容时发生错误: {e}"
+#         print(error_msg)
+#         import traceback
+#         traceback.print_exc()
+#         return error_msg
 
 
-def analyze_vector_db_content():
-    """
-    分析向量库内容，提供统计信息
-    """
-    global vector_db
+# def clear_vector_db():
+#     """
+#     清空整个向量库
+#     """
+#     global vector_db, rag_chain
     
-    if vector_db is None:
-        return "错误：向量数据库未初始化"
+#     if vector_db is None:
+#         return "错误：向量数据库未初始化"
     
-    try:
-        # 获取向量库中的所有文档
-        all_docs = vector_db.get()
-        if not all_docs or not all_docs['documents']:
-            return "向量库为空"
+#     try:
+#         # 获取所有文档ID
+#         all_docs = vector_db.get()
+#         if not all_docs or not all_docs['ids']:
+#             return "向量库已经是空的"
         
-        documents = all_docs['documents']
-        metadatas = all_docs['metadatas']
-        ids = all_docs['ids']
+#         ids_to_delete = all_docs['ids']
+#         print(f"开始清空向量库，删除 {len(ids_to_delete)} 个文档...")
         
-        # 统计信息
-        total_chunks = len(documents)
-        total_chars = sum(len(doc) for doc in documents)
-        avg_chunk_length = total_chars / total_chunks if total_chunks > 0 else 0
+#         # 删除所有文档
+#         vector_db.delete(ids=ids_to_delete)
         
-        # 按来源文件统计
-        source_stats = {}
-        for metadata in metadatas:
-            if metadata and 'source' in metadata:
-                source = metadata['source']
-                source_stats[source] = source_stats.get(source, 0) + 1
+#         # 重置RAG链
+#         rag_chain = None
         
-        # 检测潜在重复
-        content_hashes = {}
-        potential_duplicates = 0
+#         return f"向量库已清空，删除了 {len(ids_to_delete)} 个文档块"
         
-        for content in documents:
-            cleaned_content = ' '.join(content.strip().split())
-            if cleaned_content in content_hashes:
-                potential_duplicates += 1
-            else:
-                content_hashes[cleaned_content] = 1
-        
-        # 生成报告
-        report = f"## 向量库内容分析报告\n\n"
-        report += f"**基本信息：**\n"
-        report += f"- 总文档块数: {total_chunks}\n"
-        report += f"- 总字符数: {total_chars:,}\n"
-        report += f"- 平均块长度: {avg_chunk_length:.1f} 字符\n"
-        report += f"- 潜在重复块: {potential_duplicates}\n\n"
-        
-        if source_stats:
-            report += f"**按来源文件统计：**\n"
-            for source, count in sorted(source_stats.items(), key=lambda x: x[1], reverse=True):
-                report += f"- {os.path.basename(source)}: {count} 块\n"
-        
-        if potential_duplicates > 0:
-            report += f"\n**注意：** 发现 {potential_duplicates} 个潜在重复内容，建议运行重复内容清理。"
-        
-        return report
-        
-    except Exception as e:
-        error_msg = f"分析向量库内容时发生错误: {e}"
-        print(error_msg)
-        import traceback
-        traceback.print_exc()
-        return error_msg
-
-
-def clear_vector_db():
-    """
-    清空整个向量库
-    """
-    global vector_db, rag_chain
-    
-    if vector_db is None:
-        return "错误：向量数据库未初始化"
-    
-    try:
-        # 获取所有文档ID
-        all_docs = vector_db.get()
-        if not all_docs or not all_docs['ids']:
-            return "向量库已经是空的"
-        
-        ids_to_delete = all_docs['ids']
-        print(f"开始清空向量库，删除 {len(ids_to_delete)} 个文档...")
-        
-        # 删除所有文档
-        vector_db.delete(ids=ids_to_delete)
-        
-        # 重置RAG链
-        rag_chain = None
-        
-        return f"向量库已清空，删除了 {len(ids_to_delete)} 个文档块"
-        
-    except Exception as e:
-        error_msg = f"清空向量库时发生错误: {e}"
-        print(error_msg)
-        import traceback
-        traceback.print_exc()
-        return error_msg 
+#     except Exception as e:
+#         error_msg = f"清空向量库时发生错误: {e}"
+#         print(error_msg)
+#         import traceback
+#         traceback.print_exc()
+#         return error_msg 
