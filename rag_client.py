@@ -1,13 +1,14 @@
 import os
+import re
 import shutil # Import shutil for file operations
 import gradio as gr # Import Gradio
 from langchain_community.document_loaders import PyPDFLoader, Docx2txtLoader
 from langchain.text_splitter import RecursiveCharacterTextSplitter
 from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_chroma import Chroma
-from langchain import hub
-from langchain.chains import create_retrieval_chain
-from langchain.chains.combine_documents import create_stuff_documents_chain
+# from langchain import hub
+# from langchain.chains import create_retrieval_chain
+# from langchain.chains.combine_documents import create_stuff_documents_chain
 # Import ChatOpenAI for OpenAI-compatible endpoint
 from langchain_openai import ChatOpenAI
 # Import a Gradio theme
@@ -16,6 +17,7 @@ import gradio.themes as gr_themes
 from langchain.memory import ConversationBufferMemory
 from langchain.chains import ConversationalRetrievalChain
 from langchain.schema import Document
+from sentence_transformers import SentenceTransformer, util
 
 """
 上传和管理PDF/DOCX文档知识库
@@ -28,18 +30,19 @@ from langchain.schema import Document
 # --- Configuration ---
 DOCUMENTS_DIR = "./documents"  # Modify to your document directory
 PERSIST_DIR = "./chroma_db"     # Vector database storage directory 向量数据库 存储数据的（个人理解）
-EMBEDDING_MODEL_PATH = "/mnt/jrwbxx/LLM/model/Dmeta-embedding-zh" # 嵌入模型路径 将文本转换为向量  
+EMBEDDING_MODEL_PATH = "model/bge-m3" # 嵌入模型路径 将文本转换为向量  
 EMBEDDING_DEVICE = "cuda:1" # Or 'cpu' 嵌入模型设备
 # VLLM Server details (using OpenAI compatible endpoint)
 VLLM_BASE_URL = "http://localhost:7861/v1"  # 使用正确的端口 7861
 #VLLM_BASE_URL = "http://172.16.20.193:8000/v1"  
 VLLM_API_KEY = "dummy-key" # Required by ChatOpenAI, but VLLM server doesn't usually check it 
 VLLM_MODEL_NAME = "/mnt/jrwbxx/LLM/model/qwen3-1.7b"  # 修正模型路径
+SIMILARYTY_MODEL = "paraphrase-MiniLM-L6-v2"
 
 # 检索参数 检索的配置 视情况改
-CHUNK_SIZE = 512 # Adjusted for bge-m3, which can handle more context  文本块大小
+CHUNK_SIZE = 1000 # Adjusted for bge-m3, which can handle more context  文本块大小
 CHUNK_OVERLAP = 100  # Adjusted overlap (approx 20% of CHUNK_SIZE)  文本块重叠大小 这个的目的我个人觉得是确保每个块之间有联系
-SEARCH_K = 10 # Retrieve more chunks to increase chances of finding specific sentences  检索到的结果的数量
+SEARCH_K = 5 # Retrieve more chunks to increase chances of finding specific sentences  检索到的结果的数量
 # --- End Configuration ---
 
 # Global variables
@@ -53,6 +56,69 @@ memory = ConversationBufferMemory(
     return_messages=True
 )
 user_facts = []
+
+model = SentenceTransformer(SIMILARYTY_MODEL,device=EMBEDDING_DEVICE)
+
+def rewrite_question_if_needed(current_question: str, previous_question: str, similarity_threshold=0.65):
+    """
+    判断当前问题是否需要重写，如果需要，则使用大模型重写一个更合理的问题，否则返回原始问题。
+    """
+    # 1. 先做Embedding
+    current_embedding = model.encode(current_question, convert_to_tensor=True)
+    previous_embedding = model.encode(previous_question, convert_to_tensor=True)
+
+    # 2. 计算余弦相似度
+    cosine_sim = util.pytorch_cos_sim(current_embedding, previous_embedding).item()
+    print(f"当前的问题是:{current_question},上一个问题是:{previous_question},他们的余弦相似度是：{cosine_sim}")
+
+    # 3. 判断是否需要重写
+    need_rewrite = cosine_sim >= similarity_threshold
+
+    if need_rewrite:
+        #使用大模型重写问题
+        rewrite_prompt = f"""请根据上下文重写以下问题，使其更加清晰和完整。
+
+前一个问题：{previous_question}
+当前问题：{current_question}
+
+请重写当前问题，使其：
+1. 保持原意不变
+2. 消除可能的歧义
+3. 使问题更加明确和具体
+4. 只需要改写问题，不需要解释说明
+重写后的问题："""
+        
+        try:
+            # 使用RAG核心中的LLM来重写问题
+            rewritten_response = ""
+            for chunk in llm.stream(rewrite_prompt):
+                rewritten_response += chunk.content
+            
+            # 清理响应，只保留重写的问题部分
+            rewritten_question = rewritten_response.strip()
+
+            print("这是大模型重写的结果",rewritten_question)
+            
+            # 如果响应太长，可能包含了额外的解释，尝试提取问题部分
+            if len(rewritten_question) > len(current_question) * 3:
+                # 尝试找到最后一个问号或句号作为问题的结束
+                for i in range(len(rewritten_question) - 1, -1, -1):
+                    if rewritten_question[i] in ['？', '?', '。', '.']:
+                        rewritten_question = rewritten_question[:i+1]
+                        break
+            
+            print(f"问题已由大模型重写: {rewritten_question}")
+            return rewritten_question
+            
+        except Exception as e:
+            print(f"大模型重写问题失败: {e}")
+            # 如果大模型重写失败，回退到简单的重写方式
+            rewritten = f"关于\"{previous_question}\"，{current_question}"
+            return rewritten
+    else:
+    # 不需要改写
+         return current_question
+    
 # 1. 定义文档加载函数，支持PDF和Word 以及返回文档内容列表
 def load_documents(directory_path):
     documents = []
@@ -60,39 +126,92 @@ def load_documents(directory_path):
     for file in os.listdir(directory_path):
         file_path = os.path.join(directory_path, file)
 
-        if file.endswith('.pdf'): #将pdf文件解析为多个片段，然后将这些片段放入大的document中
-            loader = PyPDFLoader(file_path) #这是一个加载器，读取pdf文件，转化为文档片段（document chunks）
-            documents.extend(loader.load()) #loader.load()返回一个列表 都是document对象   然后通过extend将所有的对象放在document中 
-        elif file.endswith('.docx') or file.endswith('.doc'):
-            loader = Docx2txtLoader(file_path)
-            documents.extend(loader.load())
+        # if file.endswith('.pdf'): #将pdf文件解析为多个片段，然后将这些片段放入大的document中
+        #     loader = PyPDFLoader(file_path) #这是一个加载器，读取pdf文件，转化为文档片段（document chunks）
+        #     documents.extend(loader.load()) #loader.load()返回一个列表 都是document对象   然后通过extend将所有的对象放在document中 
+        # elif file.endswith('.docx') or file.endswith('.doc'):
+        #     loader = Docx2txtLoader(file_path)
+        #     documents.extend(loader.load())
+        try:
+            if file.endswith('.pdf'): #将pdf文件解析为多个片段，然后将这些片段放入大的document中
+                loader = PyPDFLoader(file_path) #这是一个加载器，读取pdf文件，转化为文档片段（document chunks）
+                documents.extend(loader.load()) #loader.load()返回一个列表 都是document对象   然后通过extend将所有的对象放在document中 
+            elif file.endswith('.docx') or file.endswith('.doc'):
+                loader = Docx2txtLoader(file_path)
+                documents.extend(loader.load())
+        except Exception as e:
+            print(f"警告：无法加载文件 {file}，跳过此文件。错误：{e}")
+            continue
 
     return documents
 
-# 2. 文本分割  创建出适合嵌入模型的小文本块  按照分隔符切割，每块长度不超过chunk_size 允许相邻的有chunk_overlap的字符重叠 最终返回切好的小块列表
-def split_documents(documents):
-    text_splitter = RecursiveCharacterTextSplitter(
+def split_documents(documents: list) -> list:
+    """
+    只传入 documents 列表，对每个文档先按章节分，再按块分
+    内部使用默认规则（分章节规则 + chunk_size + chunk_overlap）
+    返回所有拆分后的 Document 对象
+    """
+
+    # 固定参数
+    section_pattern = r"\n(?=\d{1,2}\s)"  # 如 1 范围、2 引用文件 章节划分的格式可以更加完善一些 目前的正则匹配是 换行+数字+空格 (?=)是正向预查
+
+    # 拆分器配置
+    splitter = RecursiveCharacterTextSplitter(
         chunk_size=CHUNK_SIZE,
         chunk_overlap=CHUNK_OVERLAP,
-        length_function=len, #这个len不是变量 而是将len函数  传入
-        separators=[ 
-            "\n\n",  # Split by double newlines (paragraphs)
-            "\n",    # Split by single newlines
-            ". ",    # Split by period followed by space (ensure space to avoid splitting mid-sentence e.g. Mr. Smith)
-            "? ",    # Split by question mark followed by space
-            "! ",    # Split by exclamation mark followed by space
-            "。 ",   # Chinese period followed by space (if applicable)
-            "？ ",   # Chinese question mark followed by space (if applicable)
-            "！ ",   # Chinese exclamation mark followed by space (if applicable)
-            "。\n",  # Chinese period followed by newline
-            "？\n",  # Chinese question mark followed by newline
-            "！\n",  # Chinese exclamation mark followed by newline
-            " ",     # Split by space as a fallback
-            ""       # Finally, split by character if no other separator is found
-        ],
+        length_function=len,
+        separators=["\n\n", "\n", "。", ". ", " ", ""], #感觉问号 感叹号什么的还是放置一起好 
         is_separator_regex=False
     )
-    return text_splitter.split_documents(documents)
+
+    all_chunks = []
+
+    for doc in documents:
+        text = doc.page_content
+        metadata = doc.metadata or {}
+
+        # 先按章节正则分
+        sections = re.split(section_pattern, text)
+
+        for section in sections:
+            cleaned = section.strip()
+            if not cleaned:
+                continue
+
+            # 短章节直接保留
+            if len(cleaned) <= CHUNK_SIZE:
+                all_chunks.append(Document(page_content=cleaned, metadata=metadata))
+            else:
+                # 长章节再拆块
+                sub_chunks = splitter.split_text(cleaned)
+                for chunk in sub_chunks:
+                    all_chunks.append(Document(page_content=chunk, metadata=metadata))
+
+    return all_chunks
+# 2. 文本分割  创建出适合嵌入模型的小文本块  按照分隔符切割，每块长度不超过chunk_size 允许相邻的有chunk_overlap的字符重叠 最终返回切好的小块列表
+# def split_documents(documents):
+#     text_splitter = RecursiveCharacterTextSplitter(
+#         chunk_size=CHUNK_SIZE,
+#         chunk_overlap=CHUNK_OVERLAP,
+#         length_function=len, #这个len不是变量 而是将len函数  传入
+#         separators=[ 
+#             "\n\n",  # Split by double newlines (paragraphs)
+#             "\n",    # Split by single newlines
+#             ". ",    # Split by period followed by space (ensure space to avoid splitting mid-sentence e.g. Mr. Smith)
+#             "? ",    # Split by question mark followed by space
+#             "! ",    # Split by exclamation mark followed by space
+#             "。 ",   # Chinese period followed by space (if applicable)
+#             "？ ",   # Chinese question mark followed by space (if applicable)
+#             "！ ",   # Chinese exclamation mark followed by space (if applicable)
+#             "。\n",  # Chinese period followed by newline
+#             "？\n",  # Chinese question mark followed by newline
+#             "！\n",  # Chinese exclamation mark followed by newline
+#             " ",     # Split by space as a fallback
+#             ""       # Finally, split by character if no other separator is found
+#         ],
+#         is_separator_regex=False
+#     )
+#     return text_splitter.split_documents(documents)
 
 # 3. 初始化HuggingFace嵌入模型 配置gpu加速  返回文本向量化器 
 def initialize_embeddings():
@@ -259,6 +378,17 @@ def rebuild_index_and_chain(): #全流程索引重建  文档加载-分割-嵌�
     # Step 2: Split text
     print("分割文本...")
     chunks = split_documents(documents)
+    #chunks = [c for c in chunks if c.page_content and isinstance(c.page_content, str) and c.page_content.strip()] #过滤掉不合规的内容
+    # 过滤和预处理：只保留非空字符串内容的chunk
+    filtered_chunks = []
+    for c in chunks:
+        if hasattr(c, 'page_content') and isinstance(c.page_content, str):
+            content = c.page_content.strip()
+            if content:
+                c.page_content = content  # 去除首尾空白
+                filtered_chunks.append(c)
+    print(f"过滤后剩余 {len(filtered_chunks)} 个有效文本块（原始 {len(chunks)} 个）")
+    chunks = filtered_chunks
     if not chunks:
         print("分割后未生成文本块。")
         # Try loading existing DB if splitting yielded nothing
@@ -360,17 +490,57 @@ def handle_file_upload(file_obj):
         # Return error and current doc list
         return f"文件上传或处理失败: {e}", get_loaded_documents_list()
 
-# Updated function to handle query submission for gr.Chatbot 管理聊天历史  显示思考中状态 更新问答 清空输入框
-def handle_submit_with_thinking(query_text, chat_history):
-    global user_facts
+def handle_memory_and_query_prep(query_text, current_user_facts): #前者是提问 后者是目前存储的内容  这个函数只会存储要求记住的内容 如果是提问，只会把之前要求记住的内容和提问拼接起来返回回去
+    """Handles the memory feature and prepares the full query."""
+    # Create a mutable copy of user_facts to modify within this function
+    updated_user_facts = list(current_user_facts)
+
     if "记住" in query_text:
         # 提取记住的内容（去掉"请记住"、"记住"等前缀）
         fact = query_text.replace("请记住", "").replace("记住", "").strip("：:，,。. ")
         if fact:
-            user_facts.append(fact)
-            chat_history.append((query_text, f"好的，我已记住：{fact}"))
-            yield "", chat_history
-            return
+            updated_user_facts.append(fact)
+            # No chat history update here, that's for the UI layer.
+            return "", updated_user_facts # Indicate it's a memory command, no query for RAG
+
+    # 拼接所有记忆内容到用户输入前面
+    if updated_user_facts: #这部分的memory_prefix都是用户要求记住的内容，可以理解为问题重写了一遍，但至少增加了一部分要求记住的内容
+        memory_prefix = "，".join(updated_user_facts)
+        full_query = f"请记住：{memory_prefix}。用户提问：{query_text}"
+    else:
+        full_query = query_text
+
+    return full_query, updated_user_facts
+
+
+# Updated function to handle query submission for gr.Chatbot 管理聊天历史  显示思考中状态 更新问答 清空输入框
+def handle_submit_with_thinking(query_text, chat_history):
+    global user_facts
+    if chat_history:
+        previous_question = chat_history[-1][0]
+    else:
+        previous_question = ""
+    rewritten_query = rewrite_question_if_needed(query_text, previous_question)
+    #测试使用 后期可以删掉
+    if rewritten_query != query_text:
+        print(f"问题已改写: {rewritten_query}")
+    else:
+        print(f"问题没有改写:{rewritten_query}")
+    query_to_use = rewritten_query 
+
+    # Call the new function to handle memory and prepare the query
+    full_query, updated_user_facts = handle_memory_and_query_prep(query_to_use, user_facts)
+
+    user_facts[:] = updated_user_facts
+    if full_query == "":
+        if "记住" in query_text:
+            # 提取记住的内容（去掉"请记住"、"记住"等前缀）
+            fact = query_text.replace("请记住", "").replace("记住", "").strip("：:，,。. ")
+            if fact:
+                user_facts.append(fact)
+                chat_history.append((query_text, f"好的，我已记住：{fact}"))
+                yield "", chat_history
+                return
 
     if not query_text or query_text.strip() == "":
         yield "", chat_history
@@ -379,9 +549,9 @@ def handle_submit_with_thinking(query_text, chat_history):
     # 拼接所有记忆内容到用户输入前面  这里可以修改一下 比如给一个顺序，没经过几次对话，就删掉之前的内容 防止内容太多 导致超过最大长度
     if user_facts:  
         memory_prefix = "，".join(user_facts)
-        full_query = f"请记住：{memory_prefix}。用户提问：{query_text}" #这个是将用户的提问和回答放在一起用于记忆
+        full_query = f"请记住：{memory_prefix}。改写后的问题：{query_to_use}" #这个是将用户的提问和回答放在一起用于记忆
     else:
-        full_query = query_text
+        full_query = query_to_use
 
     chat_history.append((query_text, "思考中..."))
     yield "", chat_history
