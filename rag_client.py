@@ -6,18 +6,17 @@ from langchain_community.document_loaders import PyPDFLoader, Docx2txtLoader
 from langchain.text_splitter import RecursiveCharacterTextSplitter
 from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_chroma import Chroma
-# from langchain import hub
-# from langchain.chains import create_retrieval_chain
-# from langchain.chains.combine_documents import create_stuff_documents_chain
-# Import ChatOpenAI for OpenAI-compatible endpoint
 from langchain_openai import ChatOpenAI
-# Import a Gradio theme
 import gradio.themes as gr_themes
 #加入记忆功能
 from langchain.memory import ConversationBufferMemory
 from langchain.chains import ConversationalRetrievalChain
 from langchain.schema import Document
 from sentence_transformers import SentenceTransformer, util
+import torch
+from langchain.embeddings.base import Embeddings
+
+
 
 """
 上传和管理PDF/DOCX文档知识库
@@ -30,7 +29,7 @@ from sentence_transformers import SentenceTransformer, util
 # --- Configuration ---
 DOCUMENTS_DIR = "./documents"  # Modify to your document directory
 PERSIST_DIR = "./chroma_db"     # Vector database storage directory 向量数据库 存储数据的（个人理解）
-EMBEDDING_MODEL_PATH = "model/bge-m3" # 嵌入模型路径 将文本转换为向量  
+EMBEDDING_MODEL_PATH = "model/bge-m3" # 嵌入模型路径 将文本转换为向量    注意这个模型出来的向量都是归一化的
 EMBEDDING_DEVICE = "cuda:1" # Or 'cpu' 嵌入模型设备
 # VLLM Server details (using OpenAI compatible endpoint)
 VLLM_BASE_URL = "http://localhost:7861/v1"  # 使用正确的端口 7861
@@ -40,9 +39,9 @@ VLLM_MODEL_NAME = "/mnt/jrwbxx/LLM/model/qwen3-1.7b"  # 修正模型路径
 SIMILARYTY_MODEL = "paraphrase-MiniLM-L6-v2"
 
 # 检索参数 检索的配置 视情况改
-CHUNK_SIZE = 1000 # Adjusted for bge-m3, which can handle more context  文本块大小
-CHUNK_OVERLAP = 100  # Adjusted overlap (approx 20% of CHUNK_SIZE)  文本块重叠大小 这个的目的我个人觉得是确保每个块之间有联系
-SEARCH_K = 5 # Retrieve more chunks to increase chances of finding specific sentences  检索到的结果的数量
+CHUNK_SIZE = 512 # Adjusted for bge-m3, which can handle more context  文本块大小
+CHUNK_OVERLAP = 50  # Adjusted overlap (approx 20% of CHUNK_SIZE)  文本块重叠大小 这个的目的我个人觉得是确保每个块之间有联系
+SEARCH_K = 10 # Retrieve more chunks to increase chances of finding specific sentences  检索到的结果的数量
 # --- End Configuration ---
 
 # Global variables
@@ -57,67 +56,53 @@ memory = ConversationBufferMemory(
 )
 user_facts = []
 
-model = SentenceTransformer(SIMILARYTY_MODEL,device=EMBEDDING_DEVICE)
+# model = SentenceTransformer(SIMILARYTY_MODEL,device=EMBEDDING_DEVICE)
 
 def rewrite_question_if_needed(current_question: str, previous_question: str, similarity_threshold=0.65):
     """
-    判断当前问题是否需要重写，如果需要，则使用大模型重写一个更合理的问题，否则返回原始问题。
+    大模型判断当前问题是否需要重写，如果需要，则使用大模型重写一个更合理的问题，否则返回原始问题。
     """
-    # 1. 先做Embedding
-    current_embedding = model.encode(current_question, convert_to_tensor=True)
-    previous_embedding = model.encode(previous_question, convert_to_tensor=True)
 
-    # 2. 计算余弦相似度
-    cosine_sim = util.pytorch_cos_sim(current_embedding, previous_embedding).item()
-    print(f"当前的问题是:{current_question},上一个问题是:{previous_question},他们的余弦相似度是：{cosine_sim}")
-
-    # 3. 判断是否需要重写
-    need_rewrite = cosine_sim >= similarity_threshold
-
-    if need_rewrite:
-        #使用大模型重写问题
-        rewrite_prompt = f"""请根据上下文重写以下问题，使其更加清晰和完整。
+    rewrite_prompt = f"""请根据上下文重写以下问题，使其更加清晰和完整。
 
 前一个问题：{previous_question}
 当前问题：{current_question}
 
 请重写当前问题，使其：
-1. 保持原意不变
-2. 消除可能的歧义
-3. 使问题更加明确和具体
-4. 只需要改写问题，不需要解释说明
+1. 结合前一个问题，使问题更加明确和具体
+2. 重写后的问题不需要结合其他问题也知道在问什么
+3. 只需要改写问题，不需要解释说明
+4. 如果当前问题已经明确，不需要改写，则直接返回当前问题
 重写后的问题："""
         
-        try:
-            # 使用RAG核心中的LLM来重写问题
-            rewritten_response = ""
-            for chunk in llm.stream(rewrite_prompt):
-                rewritten_response += chunk.content
-            
-            # 清理响应，只保留重写的问题部分
-            rewritten_question = rewritten_response.strip()
+    try:
+        # 使用RAG核心中的LLM来重写问题
+        rewritten_response = ""
+        for chunk in llm.stream(rewrite_prompt):
+            rewritten_response += chunk.content
+        
+        # 清理响应，只保留重写的问题部分
+        rewritten_question = rewritten_response.strip()
 
-            print("这是大模型重写的结果",rewritten_question)
-            
-            # 如果响应太长，可能包含了额外的解释，尝试提取问题部分
-            if len(rewritten_question) > len(current_question) * 3:
-                # 尝试找到最后一个问号或句号作为问题的结束
-                for i in range(len(rewritten_question) - 1, -1, -1):
-                    if rewritten_question[i] in ['？', '?', '。', '.']:
-                        rewritten_question = rewritten_question[:i+1]
-                        break
-            
-            print(f"问题已由大模型重写: {rewritten_question}")
-            return rewritten_question
-            
-        except Exception as e:
-            print(f"大模型重写问题失败: {e}")
-            # 如果大模型重写失败，回退到简单的重写方式
-            rewritten = f"关于\"{previous_question}\"，{current_question}"
-            return rewritten
-    else:
-    # 不需要改写
-         return current_question
+        print("这是大模型重写的结果",rewritten_question)
+        
+        # 如果响应太长，可能包含了额外的解释，尝试提取问题部分
+        if len(rewritten_question) > len(current_question) * 3:
+            # 尝试找到最后一个问号或句号作为问题的结束
+            for i in range(len(rewritten_question) - 1, -1, -1):
+                if rewritten_question[i] in ['？', '?', '。', '.']:
+                    rewritten_question = rewritten_question[:i+1]
+                    break
+        
+        print(f"问题已由大模型重写: {rewritten_question}")
+        return rewritten_question
+        
+    except Exception as e:
+        print(f"大模型重写问题失败: {e}")
+        # 如果大模型重写失败，回退到简单的重写方式
+        rewritten = f"关于\"{previous_question}\"，{current_question}"
+        return rewritten
+
     
 # 1. 定义文档加载函数，支持PDF和Word 以及返回文档内容列表
 def load_documents(directory_path):
@@ -125,13 +110,6 @@ def load_documents(directory_path):
 
     for file in os.listdir(directory_path):
         file_path = os.path.join(directory_path, file)
-
-        # if file.endswith('.pdf'): #将pdf文件解析为多个片段，然后将这些片段放入大的document中
-        #     loader = PyPDFLoader(file_path) #这是一个加载器，读取pdf文件，转化为文档片段（document chunks）
-        #     documents.extend(loader.load()) #loader.load()返回一个列表 都是document对象   然后通过extend将所有的对象放在document中 
-        # elif file.endswith('.docx') or file.endswith('.doc'):
-        #     loader = Docx2txtLoader(file_path)
-        #     documents.extend(loader.load())
         try:
             if file.endswith('.pdf'): #将pdf文件解析为多个片段，然后将这些片段放入大的document中
                 loader = PyPDFLoader(file_path) #这是一个加载器，读取pdf文件，转化为文档片段（document chunks）
@@ -188,38 +166,26 @@ def split_documents(documents: list) -> list:
                     all_chunks.append(Document(page_content=chunk, metadata=metadata))
 
     return all_chunks
-# 2. 文本分割  创建出适合嵌入模型的小文本块  按照分隔符切割，每块长度不超过chunk_size 允许相邻的有chunk_overlap的字符重叠 最终返回切好的小块列表
-# def split_documents(documents):
-#     text_splitter = RecursiveCharacterTextSplitter(
-#         chunk_size=CHUNK_SIZE,
-#         chunk_overlap=CHUNK_OVERLAP,
-#         length_function=len, #这个len不是变量 而是将len函数  传入
-#         separators=[ 
-#             "\n\n",  # Split by double newlines (paragraphs)
-#             "\n",    # Split by single newlines
-#             ". ",    # Split by period followed by space (ensure space to avoid splitting mid-sentence e.g. Mr. Smith)
-#             "? ",    # Split by question mark followed by space
-#             "! ",    # Split by exclamation mark followed by space
-#             "。 ",   # Chinese period followed by space (if applicable)
-#             "？ ",   # Chinese question mark followed by space (if applicable)
-#             "！ ",   # Chinese exclamation mark followed by space (if applicable)
-#             "。\n",  # Chinese period followed by newline
-#             "？\n",  # Chinese question mark followed by newline
-#             "！\n",  # Chinese exclamation mark followed by newline
-#             " ",     # Split by space as a fallback
-#             ""       # Finally, split by character if no other separator is found
-#         ],
-#         is_separator_regex=False
-#     )
-#     return text_splitter.split_documents(documents)
 
 # 3. 初始化HuggingFace嵌入模型 配置gpu加速  返回文本向量化器 
 def initialize_embeddings():
     return HuggingFaceEmbeddings(
         model_name=EMBEDDING_MODEL_PATH,
-        model_kwargs={'device': EMBEDDING_DEVICE}
+        model_kwargs={'device': EMBEDDING_DEVICE},
     )
+class FastBGEEmbedding(Embeddings): #
+    def __init__(self, model_name: str = "BAAI/bge-m3", device: str = "cuda"):
+        self.model = SentenceTransformer(model_name, device=device)
 
+    def embed_documents(self, texts):
+        embeddings = self.model.encode(texts, convert_to_tensor=True, batch_size=32, show_progress_bar=True) #convert_to_tensor=True 将文本转换为tensor  batch_size=32 批量处理  show_progress_bar=True 显示进度条
+        normed = torch.nn.functional.normalize(embeddings, p=2, dim=1)
+        return normed.cpu().tolist()
+
+    def embed_query(self, text):
+        emb = self.model.encode([text], convert_to_tensor=True)
+        emb = torch.nn.functional.normalize(emb, p=2, dim=1)
+        return emb[0].cpu().tolist()
 # 4. 创建或加载向量数据库 (Modified) 检测数据库状态  处理模型变更导致的维度问题 支持增量更新文档
 def get_vector_db(chunks, embeddings, persist_directory):
     """Creates a new vector DB or loads an existing one."""
@@ -241,6 +207,7 @@ def get_vector_db(chunks, embeddings, persist_directory):
             print(f"Creating new vector database in {persist_directory}...")
             print(f"Creating Chroma DB with {len(chunks)} chunks...")
             try:
+                
                 vector_db = Chroma.from_documents( #通过from_document把每个chunk转换为embedding并存到数据库
                     documents=chunks,
                     embedding=embeddings,
@@ -312,10 +279,6 @@ def process_query(query):
     try:
         print(f"开始处理流式查询: {query}")
 
-        # Directly stream from the RAG chain runnable
-        # The input format for create_retrieval_chain is typically {"input": query}
-        # The output chunks often contain 'answer' and 'context' keys
-        # response_stream = rag_chain.stream({"input": query})
         response_stream = rag_chain.stream({ #rag_chain就是之前创建的包括检索的数据 历史回答 拼接得到的结果 stream可以保证回复是一边生成一边返回   invoke和predict都是一次性返回整段内容
                 "question": query,
                                             })
@@ -328,9 +291,6 @@ def process_query(query):
             answer_part = chunk.get("answer", "") #这边将其拼接起来  如果这样的话 比如改一下 让他们一次性输出
             if answer_part:
                 full_answer += answer_part 
-                # Debugging output
-                # print(f"Raw answer_part from LLM: '{answer_part}'")
-                # print(f"Yielding to Gradio: '{full_answer}'")
                 yield full_answer # Yield the progressively built answer
 
         if not full_answer:
@@ -378,7 +338,6 @@ def rebuild_index_and_chain(): #全流程索引重建  文档加载-分割-嵌�
     # Step 2: Split text
     print("分割文本...")
     chunks = split_documents(documents)
-    #chunks = [c for c in chunks if c.page_content and isinstance(c.page_content, str) and c.page_content.strip()] #过滤掉不合规的内容
     # 过滤和预处理：只保留非空字符串内容的chunk
     filtered_chunks = []
     for c in chunks:
@@ -595,6 +554,7 @@ def main():
 
     # Initialize embeddings and LLM once
     print("初始化 Embedding 模型...")
+    #embeddings = FastBGEEmbedding(model_name=EMBEDDING_MODEL_PATH, device=EMBEDDING_DEVICE)
     embeddings = initialize_embeddings()
 
     print("初始化 LLM 客户端...")
