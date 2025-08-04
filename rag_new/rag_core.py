@@ -8,6 +8,8 @@ from langchain_chroma import Chroma
 from langchain.chains import ConversationalRetrievalChain
 from langchain.schema import Document
 from langchain_openai import ChatOpenAI
+from langchain.memory import ConversationBufferWindowMemory
+from transformers import AutoTokenizer
 from rag_new.config import (
     DOCUMENTS_DIR,
     PERSIST_DIR,
@@ -20,8 +22,7 @@ from rag_new.config import (
     CHUNK_OVERLAP,
     SEARCH_K
 )
-from langchain.memory import ConversationBufferWindowMemory
-from transformers import AutoTokenizer
+
 # Global variables
 rag_chain = None
 vector_db = None
@@ -33,7 +34,7 @@ TOKENIZER_MODEL = "/mnt/jrwbxx/LLM/model/qwen3-1.7b" #这个记得随着模型�
 tokenizer = AutoTokenizer.from_pretrained(TOKENIZER_MODEL)
 
 MAX_TURNS = 3
-MAX_TOKENS = 1024
+MAX_TOKENS = 512
 
 memory = ConversationBufferWindowMemory(
     memory_key="chat_history",
@@ -313,6 +314,30 @@ def process_query(query):
         traceback.print_exc() # Print stack trace for debugging
         yield f"处理查询时发生错误: {e}"
 
+def safe_add_documents(vector_db, chunks, max_batch_size=5000): 
+    """
+    安全分批添加文档到向量数据库
+    
+    参数:
+        vector_db: 已初始化的向量数据库对象
+        chunks: 待添加的文档块列表
+        max_batch_size: 单次批量上限
+    """
+    total_chunks = len(chunks)
+    
+    for batch_start in range(0, total_chunks, max_batch_size):
+        batch = chunks[batch_start : batch_start + max_batch_size]
+        batch_num = (batch_start // max_batch_size) + 1
+        
+        try:
+            print(f"🔄 正在添加第 {batch_num} 批（{len(batch)} 个chunk）...")
+            vector_db.add_documents(batch)
+            print(f"✅ 第 {batch_num} 批添加成功")
+        except Exception as e:
+           
+            print(f"❌ 第 {batch_num} 批添加失败（最终尝试）：{str(e)}")
+            raise  # 抛出异常终止程序
+
 # 8. Function to rebuild the index and RAG chain (Modified to add documents)
 def rebuild_index_and_chain(): #这个函数的逻辑有问题  后期需要修复
     """Loads documents, creates/updates vector DB by adding new content, and rebuilds the RAG chain."""
@@ -329,7 +354,7 @@ def rebuild_index_and_chain(): #这个函数的逻辑有问题  后期需要修�
 
     # Step 1: Load documents
     print("加载文档...")
-    documents = load_documents(DOCUMENTS_DIR) #这部分逻辑不太对 因为这个目录包括了之前的文档 那么会导致文档的重复添加 但是这是在未找到文档的情况才加载之前的向量数据库 也还好
+    documents = load_documents(DOCUMENTS_DIR) #这部分逻辑不太对 因为这个目录包括了之前的文档 那么会导致文档的重复添加 但是这是在未找到文档的情况才加载之前的向量数据库 也还好，以后删掉添加文档的功能就可以，或者增加一条添加文档后会进行筛查
     if not documents: 
         print(f"在 {DOCUMENTS_DIR} 中未找到文档。")
         # Try to load existing DB even if no new documents are found
@@ -349,8 +374,8 @@ def rebuild_index_and_chain(): #这个函数的逻辑有问题  后期需要修�
     # Step 2: Split text
     print("分割文本...") 
     chunks = split_documents(documents)
-    for chunk in chunks:
-        print("chunks是什么\n",chunk)
+    # for chunk in chunks:
+    #     print("chunks是什么\n",chunk)
     if not chunks:
         print("分割后未生成文本块。")
         # Try loading existing DB if splitting yielded nothing
@@ -374,8 +399,9 @@ def rebuild_index_and_chain(): #这个函数的逻辑有问题  后期需要修�
         print(f"向现有向量数据库添加 {len(chunks)} 个块...") #主要问题在于这个chunk可能包含重复内容
         vector_db = vector_db_loaded # Use the loaded DB
         try:
-            vector_db.add_documents(chunks)
-            print("块添加成功。")
+            safe_add_documents(vector_db, chunks, max_batch_size=5000)
+            #vector_db.add_documents(chunks) #注意 这个上传有限制，一次性的chunks不能太多 不能超过五千
+            #print("块添加成功。")
             # Persisting might be needed depending on Chroma version/setup, often automatic.
             # vector_db.persist() # Uncomment if persistence issues occur
         except Exception as e:
@@ -396,7 +422,7 @@ def rebuild_index_and_chain(): #这个函数的逻辑有问题  后期需要修�
                         mid = len(chunks) // 2
                         bisect_add(chunks[:mid], add_func)
                         bisect_add(chunks[mid:], add_func)
-            bisect_add(chunks, lambda cs: vector_db.add_documents(cs))
+            bisect_add(chunks, lambda cs: vector_db.add_documents(cs)) #lambda cs: vector_db.add_documents(cs) 实际添加操作的lambda函数
             rag_chain = create_rag_chain_with_memory(vector_db, llm, memory)
             return f"错误：向向量数据库添加文档时出错: {e}。RAG链可能使用旧数据。"
     else:
